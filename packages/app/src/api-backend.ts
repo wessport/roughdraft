@@ -1,3 +1,4 @@
+import { watchBrowserEvents } from "./browser-events";
 import {
   type BackendInfo,
   type CompleteReviewOptions,
@@ -90,25 +91,11 @@ export class ApiBackend implements StorageBackend {
     relativePath: string,
     onChange: (event: MarkdownFileChangeEvent) => void,
   ): () => void {
-    const source = new EventSource(
+    return watchBrowserEvents(
       this.buildUrl("/api/markdown-file/events", { path: relativePath }),
+      "change",
+      (data) => onChange(JSON.parse(data)),
     );
-
-    source.addEventListener("change", (event) => {
-      try {
-        onChange(JSON.parse((event as MessageEvent<string>).data));
-      } catch (error) {
-        console.error("Failed to read markdown file change event:", error);
-      }
-    });
-
-    source.onerror = (error) => {
-      console.error("Markdown file event stream failed:", error);
-    };
-
-    return () => {
-      source.close();
-    };
   }
 
   async completeReview(

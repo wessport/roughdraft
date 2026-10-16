@@ -33,6 +33,7 @@ import {
   ROUGHDRAFT_FLAVORED_MARKDOWN_PATH,
   syncRequestedPathInUrl,
 } from "./app-navigation";
+import { watchBrowserEvents } from "./browser-events";
 import { Button } from "./components/ui/button";
 import {
   Dialog,
@@ -1504,6 +1505,7 @@ export function App() {
   const documentDirtyRef = useRef(false);
   const documentSaveStateRef = useRef<DocumentSaveState>("saved");
   const documentDraftContentRef = useRef<string | null>(null);
+  const documentSavePromiseRef = useRef<Promise<Page | undefined> | null>(null);
 
   backendRef.current = backend;
   documentPageRef.current = documentPage;
@@ -1511,6 +1513,7 @@ export function App() {
   documentSaveStateRef.current = documentSaveState;
 
   const applyDocumentPage = useCallback((nextDocument: Page) => {
+    documentPageRef.current = nextDocument;
     setDocumentPage(nextDocument);
     documentDraftContentRef.current = nextDocument.content;
   }, []);
@@ -1550,10 +1553,9 @@ export function App() {
       sourceUrl.searchParams.set("path", requestedPathState.rawPath);
     }
 
-    const source = new EventSource(`${sourceUrl.pathname}${sourceUrl.search}`);
-    const handleOpenRequest = (event: Event) => {
+    const handleOpenRequest = (data: string) => {
       try {
-        const payload = JSON.parse((event as MessageEvent<string>).data) as {
+        const payload = JSON.parse(data) as {
           url?: unknown;
         };
         if (typeof payload.url !== "string" || !payload.url.trim()) return;
@@ -1568,12 +1570,11 @@ export function App() {
       }
     };
 
-    source.addEventListener("open-request", handleOpenRequest);
-
-    return () => {
-      source.removeEventListener("open-request", handleOpenRequest);
-      source.close();
-    };
+    return watchBrowserEvents(
+      `${sourceUrl.pathname}${sourceUrl.search}`,
+      "open-request",
+      handleOpenRequest,
+    );
   }, [requestedPathState.rawPath]);
 
   useEffect(() => {
@@ -1680,16 +1681,20 @@ export function App() {
 
       let savedDocument: Page | undefined;
       try {
-        savedDocument = await backendRef.current?.saveMarkdownFile(
-          activeDocumentPath,
-          content,
-          expectedVersion,
-        );
+        documentSavePromiseRef.current =
+          backendRef.current?.saveMarkdownFile(
+            activeDocumentPath,
+            content,
+            expectedVersion,
+          ) ?? null;
+        savedDocument = (await documentSavePromiseRef.current) ?? undefined;
       } catch (error) {
         if (error instanceof MarkdownFileConflictError) {
           setDocumentDiskChangeState("conflict");
         }
         throw error;
+      } finally {
+        documentSavePromiseRef.current = null;
       }
 
       const firstLine = content.split("\n")[0] || "";
@@ -1702,11 +1707,15 @@ export function App() {
         version: expectedVersion,
       };
 
-      applyDocumentPage(nextDocument);
-      documentDirtyRef.current = false;
+      // A queued save can resume before React renders. Publish its version
+      // synchronously, without replacing edits made while this write ran.
+      documentPageRef.current = nextDocument;
+      setDocumentPage(nextDocument);
+      documentDirtyRef.current =
+        documentDraftContentRef.current !== nextDocument.content;
       setDocumentDiskChangeState("clean");
     },
-    [activeDocumentPath, applyDocumentPage],
+    [activeDocumentPath],
   );
 
   const handleDocumentDirtyStateChange = useCallback((isDirty: boolean) => {
@@ -1797,38 +1806,16 @@ export function App() {
     async (options?: CompleteReviewOptions) => {
       const currentBackend = backendRef.current;
       const currentPath = activeDocumentPathRef.current;
-      const currentDocument = documentPageRef.current;
-      if (!currentBackend || !currentPath || !currentDocument) {
+      if (!currentBackend || !currentPath) {
         return { delivered: false };
       }
 
-      const content =
-        documentDraftContentRef.current ?? currentDocument.content;
-      const expectedVersion = currentDocument.version;
-      const firstLine = content.split("\n")[0] || "";
-      const fallbackTitle =
-        currentDocument.id.split("/").at(-1) || currentDocument.id;
-      const title = firstLine.replace(/^#*\s*/, "") || fallbackTitle;
-
-      const savedDocument = (await currentBackend.saveMarkdownFile(
-        currentPath,
-        content,
-        expectedVersion,
-      )) ?? {
-        ...currentDocument,
-        content,
-        title,
-      };
-
-      applyDocumentPage(savedDocument);
-      documentDirtyRef.current = false;
-      setDocumentDiskChangeState("clean");
-
+      // DocumentWorkspace has already flushed the editor's save controller.
       return currentBackend.completeReview
         ? currentBackend.completeReview(currentPath, options)
         : { delivered: false };
     },
-    [applyDocumentPage],
+    [],
   );
 
   useEffect(() => {
@@ -1837,7 +1824,12 @@ export function App() {
     let disposed = false;
     const stopWatching = backend.watchMarkdownFile(
       activeDocumentPath,
-      (event) => {
+      async (event) => {
+        // A file event can beat our own PUT response. Wait for the returned
+        // version before deciding whether this is an external edit.
+        if (documentSavePromiseRef.current) {
+          await documentSavePromiseRef.current.catch(() => undefined);
+        }
         if (disposed || event.path !== activeDocumentPath) return;
 
         const currentDocument = documentPageRef.current;
@@ -1855,7 +1847,10 @@ export function App() {
         }
 
         if (documentDirtyRef.current) {
-          setDocumentDiskChangeState("changed");
+          // A reconnect snapshot must not downgrade a rejected stale save.
+          setDocumentDiskChangeState((state) =>
+            state === "conflict" ? "conflict" : "changed",
+          );
           return;
         }
 

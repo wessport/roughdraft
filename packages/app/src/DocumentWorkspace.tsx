@@ -579,6 +579,9 @@ export function DocumentWorkspace({
         if (flushResult && flushResult.status === "error") {
           throw flushResult.error;
         }
+        if (flushResult?.status === "blocked") {
+          throw new Error("Resolve the file conflict before sending feedback");
+        }
 
         const result = await onCompleteReview(options);
         if (result.delivered) {

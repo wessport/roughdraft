@@ -1,6 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
-import { createServer as createHttpServer } from "node:http";
+import { createServer as createHttpServer, type Server } from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -9,6 +9,7 @@ import {
   extractRoughdraftReviewIndex,
 } from "@roughdraft/rfm";
 import express, { type Express, type Request, type Response } from "express";
+import { WebSocket, WebSocketServer } from "ws";
 import {
   hasNonLoopbackHost,
   ROUGHDRAFT_DEFAULT_PORT,
@@ -72,12 +73,13 @@ interface CreateAppOptions {
 interface CreateAppResult {
   app: Express;
   port: number;
+  createHttpServer: () => Server;
 }
 
 interface OpenRequestClient {
   id: number;
   path: string | null;
-  response: Response;
+  send: (payload: { path: string; url: string }) => void;
 }
 
 interface OpenRequestPayload {
@@ -827,7 +829,9 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     const client: OpenRequestClient = {
       id: nextOpenRequestClientId,
       path: requestedPath,
-      response: res,
+      send: (payload) => {
+        res.write(`event: open-request\ndata: ${JSON.stringify(payload)}\n\n`);
+      },
     };
     nextOpenRequestClientId += 1;
 
@@ -875,12 +879,7 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
       return;
     }
 
-    matchingClient.response.write(
-      `event: open-request\ndata: ${JSON.stringify({
-        path: targetPath,
-        url: targetUrl,
-      })}\n\n`,
-    );
+    matchingClient.send({ path: targetPath, url: targetUrl });
     res.json({ delivered: true });
   });
 
@@ -1234,7 +1233,108 @@ export function createApp(options: CreateAppOptions = {}): CreateAppResult {
     res.sendFile(path.join(staticDirPath, "index.html"));
   });
 
-  return { app, port };
+  // Browsers use WebSockets for these two streams to leave HTTP/1 slots free
+  // for navigation, saves, and handoff requests across any number of tabs.
+  // The SSE routes above remain available to existing clients.
+  function createBrowserServer(): Server {
+    const server = createHttpServer(app);
+    const sockets = new WebSocketServer({ noServer: true, maxPayload: 1024 });
+    server.on("close", () => sockets.close());
+    server.on("upgrade", (req, socket, head) => {
+      const host = req.headers.host;
+      const origin = req.headers.origin;
+      let url: URL;
+      try {
+        // WebSockets are not protected by CORS. Reject cross-origin pages
+        // before allowing a subscription to local file metadata.
+        const source = new URL(origin ?? "");
+        if (
+          !host ||
+          source.host !== host ||
+          !["http:", "https:"].includes(source.protocol)
+        ) {
+          throw new Error("Invalid browser origin");
+        }
+        url = new URL(req.url ?? "/", source);
+      } catch {
+        socket.end("HTTP/1.1 403 Forbidden\r\nConnection: close\r\n\r\n");
+        return;
+      }
+
+      const isFileStream = url.pathname === "/api/markdown-file/events";
+      if (!isFileStream && url.pathname !== "/api/open-requests") {
+        socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+        return;
+      }
+      const rawPath = url.searchParams.get("path");
+      const requestedPath = isFileStream ? rawPath : rawPath?.trim() || null;
+      let absolutePath: string | null = null;
+      if (isFileStream) {
+        const projectPath = url.searchParams.get("projectPath")?.trim();
+        absolutePath =
+          projectPath && requestedPath
+            ? ensureProjectPath(path.resolve(projectPath), requestedPath)
+            : null;
+        if (
+          !absolutePath?.toLowerCase().endsWith(".md") ||
+          !fs.existsSync(absolutePath)
+        ) {
+          socket.end("HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n");
+          return;
+        }
+      }
+
+      sockets.handleUpgrade(req, socket, head, (ws) => {
+        const send = (event: string, data: unknown) => {
+          if (ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ event, data: JSON.stringify(data) }));
+          }
+        };
+        ws.on("error", () => ws.close());
+        if (absolutePath) {
+          const filePath = absolutePath;
+          const sendChange = () => {
+            let version: string | null = null;
+            try {
+              version = fileVersionFromFile(filePath);
+            } catch {
+              // The file may be deleted between a stat and reading its version.
+            }
+            send("change", {
+              path: requestedPath,
+              exists: version !== null,
+              version,
+            });
+          };
+          const listener = (current: fs.Stats, previous: fs.Stats) => {
+            if (
+              current.mtimeMs !== previous.mtimeMs ||
+              current.size !== previous.size ||
+              current.nlink !== previous.nlink
+            ) {
+              sendChange();
+            }
+          };
+          fs.watchFile(filePath, { interval: 500 }, listener);
+          ws.on("close", () => fs.unwatchFile(filePath, listener));
+          // Reconcile edits made while the browser was disconnected as well.
+          sendChange();
+        } else {
+          const client: OpenRequestClient = {
+            id: nextOpenRequestClientId++,
+            path: requestedPath,
+            send: (payload) => send("open-request", payload),
+          };
+          openRequestClients.add(client);
+          ws.on("close", () => openRequestClients.delete(client));
+          send("connected", { id: client.id });
+        }
+      });
+    });
+    return server;
+  }
+
+  return { app, port, createHttpServer: createBrowserServer };
 }
 
 export const ROUGHDRAFT_TOKEN_ENV = "ROUGHDRAFT_TOKEN";
@@ -1258,7 +1358,7 @@ export async function createServer(
     );
   }
 
-  const { app } = createApp({
+  const { createHttpServer: createBrowserServer } = createApp({
     port,
     projectDir,
     remoteDocumentToken:
@@ -1270,7 +1370,7 @@ export async function createServer(
     bindHosts.map(
       (host) =>
         new Promise<void>((resolve, reject) => {
-          const server = createHttpServer(app);
+          const server = createBrowserServer();
 
           server.once("error", (error: NodeJS.ErrnoException) => {
             if (

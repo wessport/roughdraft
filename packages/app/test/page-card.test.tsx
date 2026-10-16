@@ -544,6 +544,88 @@ describe("PageCard editor integration", () => {
     expect(rendered.onSaveStateChange.mock.calls.at(-1)?.[0]).toBe("saved");
   });
 
+  it("serializes slow autosaves and concurrent flushes, draining newer edits", async () => {
+    const rendered = await renderPageCard({
+      page: { id: "slow-save", title: "Slow save", content: "Start" },
+    });
+    let releaseSave!: () => void;
+    rendered.onSave.mockImplementationOnce(
+      () =>
+        new Promise<void>((resolve) => {
+          releaseSave = resolve;
+        }),
+    );
+    vi.useFakeTimers();
+
+    await insertTextAtEnd(rendered.getEditor(), " first");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    expect(rendered.onSave).toHaveBeenCalledTimes(1);
+
+    await insertTextAtEnd(rendered.getEditor(), " second");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    expect(rendered.onSave).toHaveBeenCalledTimes(1);
+
+    let firstFlush!: Promise<ManualSaveResult>;
+    let secondFlush!: Promise<ManualSaveResult>;
+    await act(async () => {
+      firstFlush = rendered.getSaveController().flushSave();
+      secondFlush = rendered.getSaveController().flushSave();
+    });
+    await insertTextAtEnd(rendered.getEditor(), " third");
+    await act(async () => {
+      releaseSave();
+      expect(await firstFlush).toEqual({ status: "saved" });
+      expect(await secondFlush).toEqual({ status: "saved" });
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+
+    expect(rendered.onSave).toHaveBeenCalledTimes(2);
+    expect(rendered.onSave.mock.calls[1]).toEqual([
+      "slow-save",
+      expect.stringContaining("Start first second third"),
+    ]);
+    expect(rendered.onSaveStateChange.mock.calls.at(-1)?.[0]).toBe("saved");
+  });
+
+  it("propagates an in-flight autosave failure to handoff without retrying it", async () => {
+    const rendered = await renderPageCard();
+    const error = new Error("disk unavailable");
+    let rejectSave!: (error: Error) => void;
+    rendered.onSave.mockImplementationOnce(
+      () =>
+        new Promise<void>((_resolve, reject) => {
+          rejectSave = reject;
+        }),
+    );
+    vi.useFakeTimers();
+
+    await insertTextAtEnd(rendered.getEditor(), " first");
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(500);
+    });
+    await insertTextAtEnd(rendered.getEditor(), " second");
+    await act(async () => {
+      const flush = rendered.getSaveController().flushSave();
+      rejectSave(error);
+      expect(await flush).toEqual({ status: "error", error });
+      await vi.advanceTimersByTimeAsync(1000);
+    });
+    expect(rendered.onSave).toHaveBeenCalledTimes(1);
+    expect(rendered.onSaveStateChange.mock.calls.at(-1)?.[0]).toBe("error");
+
+    // A later explicit retry still saves the latest draft.
+    await act(async () => {
+      expect(await rendered.getSaveController().flushSave()).toEqual({
+        status: "saved",
+      });
+    });
+    expect(rendered.onSave.mock.calls[1]?.[1]).toContain("Start first second");
+  });
+
   it("manual save reports save failure without clearing dirty state", async () => {
     const rendered = await renderPageCard({
       page: {
