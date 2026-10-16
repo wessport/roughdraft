@@ -1021,6 +1021,70 @@ describe("cli", () => {
     });
   });
 
+  it("keeps watching across request timeouts without missing a handoff between requests", async () => {
+    const test = createTestDependencies();
+    const documentPath = path.join(projectDir, "draft.md");
+    fs.writeFileSync(documentPath, "# Draft\n");
+    const watchBodies: Array<Record<string, unknown>> = [];
+    const deps = {
+      ...test.deps,
+      fetchImpl: async (input: Parameters<typeof fetch>[0], init) => {
+        const url =
+          input instanceof URL
+            ? input
+            : new URL(
+                typeof input === "string" ? input : input.url,
+                "http://localhost",
+              );
+        if (
+          url.pathname !== "/api/review-events/watch" ||
+          typeof init?.body !== "string"
+        ) {
+          return test.deps.fetchImpl(input, init);
+        }
+
+        const body = JSON.parse(init.body) as Record<string, unknown>;
+        watchBodies.push(body);
+        if (watchBodies.length === 2) {
+          // Hand off while no watch request is open.
+          await fetch(new URL("/api/review-events", url), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ projectPath: projectDir, path: "draft.md" }),
+          });
+        }
+        // Shorten each long-poll so the test sees the request cycle quickly.
+        return test.deps.fetchImpl(input, {
+          ...init,
+          body: JSON.stringify({ ...body, timeoutSeconds: 0.05 }),
+        });
+      },
+    };
+
+    const exitCode = await runCli(
+      ["watch", documentPath, "--json", "--batch-window", "0"],
+      deps,
+    );
+    const payload = parseOnlyJsonLog<{
+      timedOut: boolean;
+      events: Array<{ type: string }>;
+    }>(test.logs);
+
+    expect(exitCode).toBe(0);
+    expect(payload.timedOut).toBe(false);
+    expect(payload.events).toMatchObject([{ type: "review.completed" }]);
+    expect(watchBodies).toHaveLength(2);
+    expect(watchBodies[0]).toMatchObject({
+      fromNow: true,
+      timeoutSeconds: 240,
+    });
+    expect(watchBodies[1]).toMatchObject({
+      fromNow: false,
+      timeoutSeconds: 240,
+    });
+    expect(typeof watchBodies[1]?.afterSequence).toBe("number");
+  });
+
   it("opens a document and waits for the next review event by default from open --json", async () => {
     const test = createTestDependencies();
     const documentPath = path.join(projectDir, "draft.md");
@@ -1077,7 +1141,7 @@ describe("cli", () => {
     expect(watchRequestBody).toMatchObject({
       batchWindowSeconds: 0,
     });
-    expect(watchRequestBody).not.toHaveProperty("timeoutSeconds");
+    expect(watchRequestBody).toMatchObject({ timeoutSeconds: 240 });
     await fetch(`http://localhost:${persisted?.port}/api/review-events`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },

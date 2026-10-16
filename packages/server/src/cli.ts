@@ -24,6 +24,7 @@ const ROUGHDRAFT_FLAVORED_MARKDOWN_SPEC_URL =
 const AGENT_SETUP_PROMPT = `Install Roughdraft for me using \`npm i -g roughdraft\`, then read ${AGENT_SETUP_URL} and set yourself up to use it.`;
 const STATUS_PATH = "/api/status";
 const STATUS_TIMEOUT_MS = 750;
+const WATCH_REQUEST_SECONDS = 240;
 const SERVER_WAIT_ATTEMPTS = 40;
 const SERVER_WAIT_DELAY_MS = 150;
 const PROCESS_WAIT_ATTEMPTS = 20;
@@ -2117,43 +2118,53 @@ async function runWatch(
     serverUrl = result.server.url;
   }
   const relativePath = path.relative(target.projectDir, target.openPath);
-  const body: {
-    projectPath: string;
-    path: string;
-    timeoutSeconds?: number;
-    batchWindowSeconds: number;
-    fromNow: boolean;
-  } = {
-    projectPath: target.projectDir,
-    path: relativePath,
-    batchWindowSeconds: options.batchWindowSeconds,
-    fromNow: !options.replay,
-  };
-  if (options.timeoutSeconds !== undefined) {
-    body.timeoutSeconds = options.timeoutSeconds;
-  }
-
-  const response = await deps.fetchImpl(
-    new URL("/api/review-events/watch", serverUrl),
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-      ...(options.timeoutSeconds !== undefined
-        ? { signal: AbortSignal.timeout((options.timeoutSeconds + 5) * 1000) }
-        : {}),
-    },
-  );
-
-  if (!response.ok) {
-    throw new Error(`Failed to watch review events: ${response.status}`);
-  }
-
-  const payload = (await response.json()) as {
+  const deadline =
+    options.timeoutSeconds !== undefined
+      ? Date.now() + options.timeoutSeconds * 1000
+      : undefined;
+  let afterSequence: number | undefined;
+  let payload: {
     events?: unknown[];
     timedOut?: boolean;
     nextSequence?: number;
   };
+
+  // Each request stays below fetch's 300-second headers timeout. Later
+  // requests resume after the last seen sequence so no handoff is missed.
+  for (;;) {
+    const requestSeconds =
+      deadline === undefined
+        ? WATCH_REQUEST_SECONDS
+        : Math.min(WATCH_REQUEST_SECONDS, (deadline - Date.now()) / 1000);
+    const body = {
+      projectPath: target.projectDir,
+      path: relativePath,
+      batchWindowSeconds: options.batchWindowSeconds,
+      timeoutSeconds: requestSeconds,
+      ...(afterSequence === undefined
+        ? { fromNow: !options.replay }
+        : { fromNow: false, afterSequence }),
+    };
+
+    const response = await deps.fetchImpl(
+      new URL("/api/review-events/watch", serverUrl),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout((requestSeconds + 5) * 1000),
+      },
+    );
+
+    if (!response.ok) {
+      throw new Error(`Failed to watch review events: ${response.status}`);
+    }
+
+    payload = (await response.json()) as typeof payload;
+    if (!payload.timedOut) break;
+    if (deadline !== undefined && Date.now() >= deadline) break;
+    afterSequence = (payload.nextSequence ?? 1) - 1;
+  }
 
   if (json) {
     emitJson(deps.log, payload);
