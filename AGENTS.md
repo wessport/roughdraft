@@ -1,5 +1,13 @@
 # Roughdraft Agent Instructions
 
+## Local-Only Changes — User Restriction
+
+Never push this project's changes to the parent/upstream repository (`Lex-Inc/roughdraft`, currently `origin`). Never open a pull request or merge request for this project on the user's behalf. This restriction overrides the generic Pull Request Workflow below. Local branches and commits do not authorize publication.
+
+## AI Memories
+
+Before starting work, check `ai_memories/index.md` and read memories relevant to the task. Store durable facts the user asks to remember in `ai_memories/` rather than relying on chat history.
+
 ## Testing Principles
 
 Use the repo-local `test-desiderata` skill when planning, adding, changing, or reviewing tests. Keep the core bar visible even when the skill is not loaded: tests should optimize for Kent Beck's Test Desiderata (https://testdesiderata.com/) as context-specific tradeoffs, not as a mechanical checklist.
