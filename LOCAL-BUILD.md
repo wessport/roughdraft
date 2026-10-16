@@ -1,6 +1,6 @@
 # Local patched build
 
-This branch carries Roughdraft patches that are not meant for upstream. It is backed up to the fork `wessport/roughdraft` (remote `fork`). Never push it to `Lex-Inc/roughdraft`; see `AGENTS.md`.
+The `wes-main` branch carries Roughdraft patches that are not meant for upstream. Build from it, start new fixes on short topic branches, merge them into `wes-main`, and rebase `wes-main` onto upstream `main` when updating. It is backed up to the fork `wessport/roughdraft` (remote `fork`). Never push it to `Lex-Inc/roughdraft`; see `AGENTS.md`.
 
 The active CLI is `~/.local/bin/roughdraft`, a symlink to
 `~/.local/share/roughdraft-save-order-patched/node_modules/.bin/roughdraft`. That install is
